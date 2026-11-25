@@ -11,246 +11,226 @@
 html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
 canvas{display:block;width:100%;height:100%;background:#000}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.8/dist/mqtt.min.js"></script>
 </head>
 <body>
 <canvas id="c"></canvas>
-<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.8/dist/mqtt.min.js"></script>
 <script>
+// ===== radar core (shared by the local ESP32 page and the remote MQTT page) =====
 const cv=document.getElementById('c'),cx=cv.getContext('2d');
 let W=0,H=0,CX=0,CY=0,R=0,dpr=1;
-const MAXR=400;
-let sweep=90,prevSweep=90,dir=1,csi=0,ready=0;
-let room=[];          // [{a,r}]
-let tracks={};        // id -> {a,r,trail:[{a,r,t}]}
-let afterglow=[];     // [{a,r,t}]
-const TRAIL_MS=2800, GLOW_MS=2200;
+const MAXR=400, AMIN=15, AMAX=165;
+let csi=0, ready=false, lastMsg=0, linkOk=false;
+// sweep model: extrapolated locally every frame, gently corrected by data
+let sw={lastA:90,lastT:0,dir:1,speed:37.5,disp:90,have:false};
+let roomT={}, roomD={};            // angle -> target r / displayed r
+let tracks={};                     // id -> {ta,tr,a,r,lit,trail:[],dead}
+let ripple=null, onRefresh=null;
+const TRAIL_MS=3000;
 
 function layout(){
-  dpr=Math.min(window.devicePixelRatio||1,2.5);
+  dpr=Math.min(window.devicePixelRatio||1,2);
   W=window.innerWidth; H=window.innerHeight;
   cv.width=(W*dpr)|0; cv.height=(H*dpr)|0;
   cv.style.width=W+'px'; cv.style.height=H+'px';
   cx.setTransform(dpr,0,0,dpr,0,0);
-  const pad=Math.max(14, Math.min(W,H)*0.03);
-  CX=W/2; CY=H-pad;
-  R=Math.min(W*0.5-pad, CY-pad);
+  const pad=Math.max(14,Math.min(W,H)*0.03);
+  CX=W/2; CY=H-pad; R=Math.min(W*0.5-pad,CY-pad);
+  grid=null;
 }
+let grid=null;   // pre-rendered static grid (cheap frames = no stutter on phones)
 window.addEventListener('resize',layout,{passive:true});
-window.addEventListener('orientationchange',()=>setTimeout(layout,200));
-layout();
-
+window.addEventListener('orientationchange',()=>setTimeout(layout,250));
 function polar(a,r){const t=a*Math.PI/180;return[CX+r*Math.cos(t),CY-r*Math.sin(t)];}
 
-function drawGrid(){
-  cx.save();
-  // vignette
-  const g=cx.createRadialGradient(CX,CY,R*0.08,CX,CY,R*1.08);
-  g.addColorStop(0,'#00180a');
-  g.addColorStop(1,'#000400');
-  cx.fillStyle=g; cx.fillRect(0,0,W,H);
-  const vg=cx.createRadialGradient(CX,CY,0,CX,CY,R);
-  vg.addColorStop(0,'rgba(0,40,18,0.65)');
-  vg.addColorStop(1,'rgba(0,0,0,0)');
-  cx.fillStyle=vg;
-  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.fill();
-
-  // CSI intensifies the phosphor wash
-  const wash=0.05+0.16*csi;
-  cx.fillStyle='rgba(0,255,80,'+wash+')';
-  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.fill();
-
-  cx.strokeStyle='rgba(0,180,70,'+(0.22+0.15*csi)+')';
-  cx.lineWidth=1;
-  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.stroke();
-
-  const rings=4;
-  cx.font=Math.max(9, Math.round(R*0.028))+'px ui-monospace,Menlo,Consolas,monospace';
-  cx.textAlign='left'; cx.textBaseline='middle';
-  for(let i=1;i<=rings;i++){
-    const rr=R*i/rings;
-    cx.strokeStyle='rgba(0,200,80,'+(0.16+0.08*csi)+')';
-    cx.beginPath(); cx.arc(CX,CY,rr,Math.PI,0); cx.stroke();
-    const lab=Math.round(MAXR*i/rings);
-    cx.fillStyle='rgba(80,200,110,0.35)';
-    cx.textAlign='right';
-    cx.fillText(lab, CX+rr-6, CY-10);
-    cx.textAlign='left';
+function buildGrid(){
+  grid=document.createElement('canvas');
+  grid.width=cv.width; grid.height=cv.height;
+  const g=grid.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  const bg=g.createRadialGradient(CX,CY,R*0.05,CX,CY,R*1.1);
+  bg.addColorStop(0,'#00160a'); bg.addColorStop(1,'#000300');
+  g.fillStyle=bg; g.fillRect(0,0,W,H);
+  g.strokeStyle='rgba(0,200,80,0.30)'; g.lineWidth=1;
+  g.beginPath(); g.arc(CX,CY,R,Math.PI,0); g.stroke();
+  g.font=Math.max(9,Math.round(R*0.028))+'px ui-monospace,Menlo,Consolas,monospace';
+  g.textAlign='right'; g.textBaseline='middle';
+  for(let i=1;i<=4;i++){
+    const rr=R*i/4;
+    g.strokeStyle='rgba(0,200,80,0.17)';
+    g.beginPath(); g.arc(CX,CY,rr,Math.PI,0); g.stroke();
+    g.fillStyle='rgba(80,200,110,0.35)'; g.fillText(Math.round(MAXR*i/4),CX+rr-6,CY-10);
   }
   for(let a=0;a<=180;a+=15){
-    const thick=(a%30===0);
-    cx.strokeStyle=thick?'rgba(0,200,80,0.28)':'rgba(0,200,80,0.10)';
-    cx.lineWidth=thick?1.2:0.6;
-    const[x,y]=polar(a,R);
-    cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
+    const th=a%30===0; g.strokeStyle=th?'rgba(0,200,80,0.26)':'rgba(0,200,80,0.09)';
+    g.lineWidth=th?1.1:0.6; const[x,y]=polar(a,R);
+    g.beginPath(); g.moveTo(CX,CY); g.lineTo(x,y); g.stroke();
   }
-  cx.strokeStyle='rgba(0,200,80,0.35)'; cx.lineWidth=1.4;
-  cx.beginPath(); cx.moveTo(CX-R,CY); cx.lineTo(CX+R,CY); cx.stroke();
-  cx.restore();
+  g.strokeStyle='rgba(0,200,80,0.35)'; g.lineWidth=1.4;
+  g.beginPath(); g.moveTo(CX-R,CY); g.lineTo(CX+R,CY); g.stroke();
 }
 
-function drawMap(){
-  if(!room.length) return;
-  const pts=room.filter(p=>p.r>0&&p.r<=MAXR).sort((a,b)=>a.a-b.a);
-  if(!pts.length) return;
-  function strokeMap(w,col){
-    cx.strokeStyle=col; cx.lineWidth=w; cx.lineJoin='round'; cx.lineCap='round';
-    cx.beginPath();
-    let on=false, pr=0, pa=0;
-    for(const p of pts){
-      const[x,y]=polar(p.a, R*p.r/MAXR);
-      if(!on){cx.moveTo(x,y); on=true;}
-      else if(Math.abs(p.r-pr)>80 || p.a-pa>10){cx.stroke(); cx.beginPath(); cx.moveTo(x,y);}
+function applyState(j,now){
+  lastMsg=now;
+  if(typeof j.csi==='number') csi=j.csi;
+  if(typeof j.ready==='boolean') ready=j.ready;
+  if(typeof j.a==='number'){
+    const d=(j.d===1||j.d===-1)?j.d:sw.dir;
+    if(!sw.have){ sw.disp=j.a; sw.have=true; }
+    else if(d===sw.dir && now>sw.lastT){
+      const dt=(now-sw.lastT)/1000, mv=Math.abs(j.a-sw.lastA);
+      if(dt>0.04 && dt<1.5 && j.a>AMIN+12 && j.a<AMAX-12){
+        const inst=mv/dt; if(inst>5&&inst<150) sw.speed+= (inst-sw.speed)*0.08;
+      }
+    }
+    sw.dir=d; sw.lastA=j.a; sw.lastT=now;
+  }
+  if(Array.isArray(j.m)){
+    const nt={}; for(const p of j.m) nt[p[0]]=p[1];
+    roomT=nt; for(const k in nt) if(roomD[k]===undefined) roomD[k]=nt[k];
+    for(const k in roomD) if(nt[k]===undefined) delete roomD[k];
+  }
+  if(Array.isArray(j.t)){
+    const seen={};
+    for(const row of j.t){
+      const id=row[0],a=row[1],r=row[2]; seen[id]=1;
+      let tr=tracks[id];
+      if(!tr) tr=tracks[id]={ta:a,tr:r,a:a,r:r,lit:now,trail:[],dead:0,lastPush:0};
+      tr.ta=a; tr.tr=r; tr.dead=0;
+    }
+    for(const id in tracks) if(!seen[id] && !tracks[id].dead) tracks[id].dead=now;
+  }
+}
+
+function stepSweep(now,dt){
+  let p=sw.lastA+sw.dir*sw.speed*(now-sw.lastT)/1000;
+  if(p>AMAX) p=AMAX; if(p<AMIN) p=AMIN;
+  if(now-lastMsg>2500) return;                // feed lost: hold still, don't spin fake
+  sw.disp+=(p-sw.disp)*Math.min(1,dt*9);
+}
+
+function drawMap(dt){
+  const keys=Object.keys(roomD).map(Number).sort((a,b)=>a-b);
+  if(!keys.length) return;
+  const k=Math.min(1,dt*1.5);
+  for(const a of keys){ if(roomT[a]!==undefined) roomD[a]+=(roomT[a]-roomD[a])*k; }
+  const al=ready?0.36:0.16;
+  for(const pass of [[6,'rgba(0,255,90,'+(al*0.22)+')'],[2,'rgba(70,255,130,'+al+')']]){
+    cx.strokeStyle=pass[1]; cx.lineWidth=pass[0]; cx.lineJoin='round'; cx.lineCap='round';
+    cx.beginPath(); let on=false,pa=0,pr=0;
+    for(const a of keys){
+      const r=roomD[a]; if(!(r>0&&r<=MAXR)) {on=false; continue;}
+      const[x,y]=polar(a,R*r/MAXR);
+      if(!on||a-pa>8||Math.abs(r-pr)>Math.max(40,r*0.25)){cx.moveTo(x,y);on=true;}
       else cx.lineTo(x,y);
-      pr=p.r; pa=p.a;
+      pa=a; pr=r;
     }
     cx.stroke();
-  }
-  const dim=ready?0.38:0.18;
-  strokeMap(6,'rgba(0,255,90,'+(0.08*dim/0.38)+')');
-  strokeMap(2.2,'rgba(70,255,130,'+dim+')');
-  // faint vertices
-  cx.fillStyle='rgba(90,255,140,'+(ready?0.28:0.12)+')';
-  for(const p of pts){
-    const[x,y]=polar(p.a, R*p.r/MAXR);
-    cx.beginPath(); cx.arc(x,y,1.4,0,7); cx.fill();
   }
 }
 
 function drawSweep(){
-  const d=Math.sign(sweep-prevSweep)||dir||1;
-  const fan=22;
-  for(let i=fan;i>=0;i--){
-    const a=sweep-d*i*0.9;
-    if(a<0||a>180) continue;
-    const[x,y]=polar(a,R);
-    const al=(1-i/fan);
-    cx.strokeStyle='rgba(80,255,120,'+(0.04+0.10*al*(0.5+csi))+')';
-    cx.lineWidth=Math.max(6,R*0.04)*(1-i/fan);
-    cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
-  }
-  const[x,y]=polar(sweep,R);
-  cx.strokeStyle='rgba(180,255,190,'+(0.75+0.25*csi)+')';
-  cx.lineWidth=1.8;
-  cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
-}
-
-function drawAfterglow(now){
-  afterglow=afterglow.filter(b=>now-b.t<GLOW_MS);
-  for(const b of afterglow){
-    const age=(now-b.t)/GLOW_MS, al=(1-age)*0.55;
-    if(b.r<=0||b.r>MAXR) continue;
-    const[x,y]=polar(b.a, R*b.r/MAXR);
-    cx.fillStyle='rgba(120,255,150,'+al+')';
-    cx.beginPath(); cx.arc(x,y,3+2*(1-age),0,7); cx.fill();
-  }
-}
-
-function drawTracks(now){
-  for(const id in tracks){
-    const tr=tracks[id];
-    tr.trail=tr.trail.filter(p=>now-p.t<TRAIL_MS);
-    // trail
-    for(let i=0;i<tr.trail.length;i++){
-      const p=tr.trail[i];
-      if(p.r<=0||p.r>MAXR) continue;
-      const al=0.15+0.7*(i+1)/tr.trail.length * (1-(now-p.t)/TRAIL_MS);
-      const[x,y]=polar(p.a, R*p.r/MAXR);
-      const rad=2+3*(i+1)/tr.trail.length;
-      cx.fillStyle='rgba(160,255,180,'+Math.max(0,al)+')';
-      cx.beginPath(); cx.arc(x,y,rad,0,7); cx.fill();
-    }
-    if(tr.r>0&&tr.r<=MAXR){
-      const[x,y]=polar(tr.a, R*tr.r/MAXR);
-      const bloom=cx.createRadialGradient(x,y,0,x,y,18+10*csi);
-      bloom.addColorStop(0,'rgba(230,255,230,0.95)');
-      bloom.addColorStop(0.25,'rgba(80,255,120,0.85)');
-      bloom.addColorStop(1,'rgba(80,255,120,0)');
-      cx.fillStyle=bloom;
-      cx.beginPath(); cx.arc(x,y,18+10*csi,0,7); cx.fill();
-      cx.fillStyle='#e8ffe8';
-      cx.beginPath(); cx.arc(x,y,3.2,0,7); cx.fill();
-    }
-  }
-}
-
-function draw(){
-  const now=performance.now();
-  drawGrid();
-  drawMap();
-  drawSweep();
-  drawAfterglow(now);
-  drawTracks(now);
-  // origin pip
-  cx.fillStyle='rgba(140,255,160,0.8)';
-  cx.beginPath(); cx.arc(CX,CY,3,0,7); cx.fill();
-  drawLink();
-  requestAnimationFrame(draw);
-}
-
-
-const MQTT_URL='wss://broker.emqx.io:8084/mqtt';
-const TOPIC_LIVE='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/l';
-const TOPIC_MAP='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/m';
-
-function applyState(j, now){
-  if(typeof j.a==='number'){ prevSweep=sweep; sweep=j.a; }
-  if(typeof j.d==='number') dir=j.d||dir;
-  if(typeof j.csi==='number') csi=j.csi;
-  if('ready' in j) ready=!!j.ready;
-  if(j.m) room=j.m.map(p=>({a:p[0],r:p[1]}));
-  const seen={};
-  if(j.t){
-    for(const row of j.t){
-      const id=row[0], a=row[1], r=row[2];
-      seen[id]=1;
-      if(!tracks[id]) tracks[id]={a,r,trail:[]};
-      const tr=tracks[id];
-      if(tr.a!==a || tr.r!==r){
-        tr.trail.push({a,r,t:now});
-        afterglow.push({a,r,t:now});
-      }
-      tr.a=a; tr.r=r; delete tr.dead;
-    }
-  }
-  for(const id in tracks) if(!seen[id]){
-    const tr=tracks[id];
-    if(!tr.dead) tr.dead=now;
-    if(now-tr.dead>TRAIL_MS) delete tracks[id];
-  }
-  if(typeof j.seq==='number') since=j.seq;
-}
-
-let mqttOk=false;
-function connectMqtt(){
-  if(typeof mqtt==='undefined'){ setTimeout(connectMqtt,500); return; }
-  const c=mqtt.connect(MQTT_URL,{
-    clientId:'wfrw-'+Math.random().toString(16).slice(2,10)+Date.now().toString(16).slice(-4),
-    clean:true,
-    reconnectPeriod:2500,
-    connectTimeout:12000,
-    keepalive:30
-  });
-  c.on('connect',()=>{ mqttOk=true; c.subscribe(TOPIC_LIVE,{qos:0}); c.subscribe(TOPIC_MAP,{qos:0}); });
-  c.on('reconnect',()=>{ mqttOk=false; });
-  c.on('close',()=>{ mqttOk=false; });
-  c.on('error',()=>{ mqttOk=false; });
-  c.on('message',(_t,payload)=>{
-    try{ applyState(JSON.parse(payload.toString()), performance.now()); }catch(e){}
-  });
-}
-
-let inflight=false, since=0;
-async function poll(){ /* local polling unused on the remote page */ }
-function drawLink(){
-  // tiny status pip, no text: green = live feed, dim red = reconnecting
-  const x=W-12,y=12;
+  const a0=sw.disp, d=sw.dir, N=12, tail=24;
   cx.save();
-  cx.fillStyle=mqttOk?'rgba(80,255,120,0.7)':'rgba(180,40,40,0.55)';
-  cx.beginPath(); cx.arc(x,y,3.5,0,7); cx.fill();
+  for(let i=0;i<N;i++){                       // phosphor wedge trailing the beam
+    const s=a0-d*tail*i/N, e=a0-d*tail*(i+1)/N;
+    const t0=-s*Math.PI/180, t1=-e*Math.PI/180;
+    cx.fillStyle='rgba(90,255,130,'+((0.16+0.12*csi)*(1-i/N))+')';
+    cx.beginPath(); cx.moveTo(CX,CY); cx.arc(CX,CY,R,Math.min(t0,t1),Math.max(t0,t1)); cx.closePath(); cx.fill();
+  }
+  const[x,y]=polar(a0,R);
+  cx.strokeStyle='rgba(190,255,200,'+(0.8+0.2*csi)+')'; cx.lineWidth=1.8;
+  cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
   cx.restore();
 }
 
+function drawTracks(now,dt){
+  const k=Math.min(1,dt*3.5);
+  for(const id in tracks){
+    const tr=tracks[id];
+    if(tr.dead && now-tr.dead>TRAIL_MS){ delete tracks[id]; continue; }
+    tr.a+=(tr.ta-tr.a)*k; tr.r+=(tr.tr-tr.r)*k;
+    if(Math.abs(sw.disp-tr.a)<3) tr.lit=now;               // beam repaints the blip
+    if(!tr.dead && now-tr.lastPush>180){ tr.trail.push({a:tr.a,r:tr.r,t:now}); tr.lastPush=now; }
+    tr.trail=tr.trail.filter(p=>now-p.t<TRAIL_MS);
+    for(let i=0;i<tr.trail.length;i++){
+      const p=tr.trail[i], age=(now-p.t)/TRAIL_MS;
+      const[x,y]=polar(p.a,R*p.r/MAXR);
+      cx.fillStyle='rgba(140,255,170,'+(0.45*(1-age))+')';
+      cx.beginPath(); cx.arc(x,y,1.5+2*(1-age),0,7); cx.fill();
+    }
+    if(tr.dead) continue;
+    const glow=0.35+0.65*Math.exp(-(now-tr.lit)/1600);
+    const[x,y]=polar(tr.a,R*Math.min(tr.r,MAXR)/MAXR);
+    const rad=14+8*csi;
+    const b=cx.createRadialGradient(x,y,0,x,y,rad);
+    b.addColorStop(0,'rgba(230,255,230,'+glow+')');
+    b.addColorStop(0.3,'rgba(80,255,120,'+(0.8*glow)+')');
+    b.addColorStop(1,'rgba(80,255,120,0)');
+    cx.fillStyle=b; cx.beginPath(); cx.arc(x,y,rad,0,7); cx.fill();
+  }
+}
+
+let lastFrame=0;
+function draw(){
+  const now=performance.now(), dt=Math.min(0.1,(now-(lastFrame||now))/1000); lastFrame=now;
+  if(!grid) buildGrid();
+  cx.drawImage(grid,0,0,W,H);
+  if(csi>0.02){ cx.fillStyle='rgba(0,255,80,'+(0.12*csi)+')'; cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.fill(); }
+  stepSweep(now,dt);
+  drawMap(dt);
+  drawSweep();
+  drawTracks(now,dt);
+  cx.fillStyle='rgba(140,255,160,0.8)'; cx.beginPath(); cx.arc(CX,CY,3,0,7); cx.fill();
+  const ok=now-lastMsg<2500;
+  cx.fillStyle=ok?'rgba(80,255,120,0.6)':'rgba(190,40,40,0.6)';
+  cx.beginPath(); cx.arc(W-12,12,3.5,0,7); cx.fill();
+  if(ripple){
+    const age=(now-ripple.t)/550;
+    if(age>=1) ripple=null;
+    else{
+      cx.strokeStyle='rgba(140,255,170,'+(0.65*(1-age))+')';
+      cx.lineWidth=1.5;
+      cx.beginPath(); cx.arc(ripple.x,ripple.y,8+age*48,0,7); cx.stroke();
+    }
+  }
+  requestAnimationFrame(draw);
+}
+layout();
+
+function triggerRefresh(x,y){
+  const now=performance.now();
+  tracks={};
+  sw.have=false;
+  ripple={x:(typeof x==='number'?x:CX), y:(typeof y==='number'?y:CY), t:now};
+  if(typeof onRefresh==='function') onRefresh();
+}
+cv.addEventListener('dblclick',e=>triggerRefresh(e.clientX,e.clientY));
+let lastTapT=0, lastTapX=0, lastTapY=0;
+cv.addEventListener('pointerup',e=>{
+  if(e.pointerType==='mouse') return;
+  const now=performance.now(), dx=e.clientX-lastTapX, dy=e.clientY-lastTapY;
+  if(now-lastTapT<340 && (dx*dx+dy*dy)<2000){
+    lastTapT=0; triggerRefresh(e.clientX,e.clientY);
+  }else{
+    lastTapT=now; lastTapX=e.clientX; lastTapY=e.clientY;
+  }
+},{passive:true});
+// ---- remote transport: MQTT over secure WebSockets ----
+const MQTT_URL='wss://broker.emqx.io:8084/mqtt';
+const TOPIC_LIVE='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/l';
+const TOPIC_MAP='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/m';
+let mq=null;
+function connectMqtt(){
+  if(typeof mqtt==='undefined'){ setTimeout(connectMqtt,500); return; }
+  if(mq){ try{mq.end(true);}catch(e){} mq=null; }
+  const c=mqtt.connect(MQTT_URL,{clientId:'wfrw-'+Math.random().toString(16).slice(2,10),
+    clean:true,reconnectPeriod:2500,connectTimeout:12000,keepalive:30});
+  mq=c;
+  c.on('connect',()=>{ if(mq===c) c.subscribe([TOPIC_LIVE,TOPIC_MAP],{qos:0}); });
+  c.on('message',(_t,p)=>{ if(mq!==c) return; try{ applyState(JSON.parse(p.toString()),performance.now()); }catch(e){} });
+}
+onRefresh=()=>{ lastMsg=0; connectMqtt(); };
 connectMqtt();
-draw();
+requestAnimationFrame(draw);
 </script>
 </body></html>
