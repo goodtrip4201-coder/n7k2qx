@@ -1,0 +1,256 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>RADAR</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+canvas{display:block;width:100%;height:100%;background:#000}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.8/dist/mqtt.min.js"></script>
+<script>
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+let W=0,H=0,CX=0,CY=0,R=0,dpr=1;
+const MAXR=400;
+let sweep=90,prevSweep=90,dir=1,csi=0,ready=0;
+let room=[];          // [{a,r}]
+let tracks={};        // id -> {a,r,trail:[{a,r,t}]}
+let afterglow=[];     // [{a,r,t}]
+const TRAIL_MS=2800, GLOW_MS=2200;
+
+function layout(){
+  dpr=Math.min(window.devicePixelRatio||1,2.5);
+  W=window.innerWidth; H=window.innerHeight;
+  cv.width=(W*dpr)|0; cv.height=(H*dpr)|0;
+  cv.style.width=W+'px'; cv.style.height=H+'px';
+  cx.setTransform(dpr,0,0,dpr,0,0);
+  const pad=Math.max(14, Math.min(W,H)*0.03);
+  CX=W/2; CY=H-pad;
+  R=Math.min(W*0.5-pad, CY-pad);
+}
+window.addEventListener('resize',layout,{passive:true});
+window.addEventListener('orientationchange',()=>setTimeout(layout,200));
+layout();
+
+function polar(a,r){const t=a*Math.PI/180;return[CX+r*Math.cos(t),CY-r*Math.sin(t)];}
+
+function drawGrid(){
+  cx.save();
+  // vignette
+  const g=cx.createRadialGradient(CX,CY,R*0.08,CX,CY,R*1.08);
+  g.addColorStop(0,'#00180a');
+  g.addColorStop(1,'#000400');
+  cx.fillStyle=g; cx.fillRect(0,0,W,H);
+  const vg=cx.createRadialGradient(CX,CY,0,CX,CY,R);
+  vg.addColorStop(0,'rgba(0,40,18,0.65)');
+  vg.addColorStop(1,'rgba(0,0,0,0)');
+  cx.fillStyle=vg;
+  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.fill();
+
+  // CSI intensifies the phosphor wash
+  const wash=0.05+0.16*csi;
+  cx.fillStyle='rgba(0,255,80,'+wash+')';
+  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.fill();
+
+  cx.strokeStyle='rgba(0,180,70,'+(0.22+0.15*csi)+')';
+  cx.lineWidth=1;
+  cx.beginPath(); cx.arc(CX,CY,R,Math.PI,0); cx.stroke();
+
+  const rings=4;
+  cx.font=Math.max(9, Math.round(R*0.028))+'px ui-monospace,Menlo,Consolas,monospace';
+  cx.textAlign='left'; cx.textBaseline='middle';
+  for(let i=1;i<=rings;i++){
+    const rr=R*i/rings;
+    cx.strokeStyle='rgba(0,200,80,'+(0.16+0.08*csi)+')';
+    cx.beginPath(); cx.arc(CX,CY,rr,Math.PI,0); cx.stroke();
+    const lab=Math.round(MAXR*i/rings);
+    cx.fillStyle='rgba(80,200,110,0.35)';
+    cx.textAlign='right';
+    cx.fillText(lab, CX+rr-6, CY-10);
+    cx.textAlign='left';
+  }
+  for(let a=0;a<=180;a+=15){
+    const thick=(a%30===0);
+    cx.strokeStyle=thick?'rgba(0,200,80,0.28)':'rgba(0,200,80,0.10)';
+    cx.lineWidth=thick?1.2:0.6;
+    const[x,y]=polar(a,R);
+    cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
+  }
+  cx.strokeStyle='rgba(0,200,80,0.35)'; cx.lineWidth=1.4;
+  cx.beginPath(); cx.moveTo(CX-R,CY); cx.lineTo(CX+R,CY); cx.stroke();
+  cx.restore();
+}
+
+function drawMap(){
+  if(!room.length) return;
+  const pts=room.filter(p=>p.r>0&&p.r<=MAXR).sort((a,b)=>a.a-b.a);
+  if(!pts.length) return;
+  function strokeMap(w,col){
+    cx.strokeStyle=col; cx.lineWidth=w; cx.lineJoin='round'; cx.lineCap='round';
+    cx.beginPath();
+    let on=false, pr=0, pa=0;
+    for(const p of pts){
+      const[x,y]=polar(p.a, R*p.r/MAXR);
+      if(!on){cx.moveTo(x,y); on=true;}
+      else if(Math.abs(p.r-pr)>80 || p.a-pa>10){cx.stroke(); cx.beginPath(); cx.moveTo(x,y);}
+      else cx.lineTo(x,y);
+      pr=p.r; pa=p.a;
+    }
+    cx.stroke();
+  }
+  const dim=ready?0.38:0.18;
+  strokeMap(6,'rgba(0,255,90,'+(0.08*dim/0.38)+')');
+  strokeMap(2.2,'rgba(70,255,130,'+dim+')');
+  // faint vertices
+  cx.fillStyle='rgba(90,255,140,'+(ready?0.28:0.12)+')';
+  for(const p of pts){
+    const[x,y]=polar(p.a, R*p.r/MAXR);
+    cx.beginPath(); cx.arc(x,y,1.4,0,7); cx.fill();
+  }
+}
+
+function drawSweep(){
+  const d=Math.sign(sweep-prevSweep)||dir||1;
+  const fan=22;
+  for(let i=fan;i>=0;i--){
+    const a=sweep-d*i*0.9;
+    if(a<0||a>180) continue;
+    const[x,y]=polar(a,R);
+    const al=(1-i/fan);
+    cx.strokeStyle='rgba(80,255,120,'+(0.04+0.10*al*(0.5+csi))+')';
+    cx.lineWidth=Math.max(6,R*0.04)*(1-i/fan);
+    cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
+  }
+  const[x,y]=polar(sweep,R);
+  cx.strokeStyle='rgba(180,255,190,'+(0.75+0.25*csi)+')';
+  cx.lineWidth=1.8;
+  cx.beginPath(); cx.moveTo(CX,CY); cx.lineTo(x,y); cx.stroke();
+}
+
+function drawAfterglow(now){
+  afterglow=afterglow.filter(b=>now-b.t<GLOW_MS);
+  for(const b of afterglow){
+    const age=(now-b.t)/GLOW_MS, al=(1-age)*0.55;
+    if(b.r<=0||b.r>MAXR) continue;
+    const[x,y]=polar(b.a, R*b.r/MAXR);
+    cx.fillStyle='rgba(120,255,150,'+al+')';
+    cx.beginPath(); cx.arc(x,y,3+2*(1-age),0,7); cx.fill();
+  }
+}
+
+function drawTracks(now){
+  for(const id in tracks){
+    const tr=tracks[id];
+    tr.trail=tr.trail.filter(p=>now-p.t<TRAIL_MS);
+    // trail
+    for(let i=0;i<tr.trail.length;i++){
+      const p=tr.trail[i];
+      if(p.r<=0||p.r>MAXR) continue;
+      const al=0.15+0.7*(i+1)/tr.trail.length * (1-(now-p.t)/TRAIL_MS);
+      const[x,y]=polar(p.a, R*p.r/MAXR);
+      const rad=2+3*(i+1)/tr.trail.length;
+      cx.fillStyle='rgba(160,255,180,'+Math.max(0,al)+')';
+      cx.beginPath(); cx.arc(x,y,rad,0,7); cx.fill();
+    }
+    if(tr.r>0&&tr.r<=MAXR){
+      const[x,y]=polar(tr.a, R*tr.r/MAXR);
+      const bloom=cx.createRadialGradient(x,y,0,x,y,18+10*csi);
+      bloom.addColorStop(0,'rgba(230,255,230,0.95)');
+      bloom.addColorStop(0.25,'rgba(80,255,120,0.85)');
+      bloom.addColorStop(1,'rgba(80,255,120,0)');
+      cx.fillStyle=bloom;
+      cx.beginPath(); cx.arc(x,y,18+10*csi,0,7); cx.fill();
+      cx.fillStyle='#e8ffe8';
+      cx.beginPath(); cx.arc(x,y,3.2,0,7); cx.fill();
+    }
+  }
+}
+
+function draw(){
+  const now=performance.now();
+  drawGrid();
+  drawMap();
+  drawSweep();
+  drawAfterglow(now);
+  drawTracks(now);
+  // origin pip
+  cx.fillStyle='rgba(140,255,160,0.8)';
+  cx.beginPath(); cx.arc(CX,CY,3,0,7); cx.fill();
+  drawLink();
+  requestAnimationFrame(draw);
+}
+
+
+const MQTT_URL='wss://broker.emqx.io:8084/mqtt';
+const TOPIC_LIVE='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/l';
+const TOPIC_MAP='wfr/sJ6igkE0yxCfa0mvfo03xCNDSA129Hcc/m';
+
+function applyState(j, now){
+  if(typeof j.a==='number'){ prevSweep=sweep; sweep=j.a; }
+  if(typeof j.d==='number') dir=j.d||dir;
+  if(typeof j.csi==='number') csi=j.csi;
+  if('ready' in j) ready=!!j.ready;
+  if(j.m) room=j.m.map(p=>({a:p[0],r:p[1]}));
+  const seen={};
+  if(j.t){
+    for(const row of j.t){
+      const id=row[0], a=row[1], r=row[2];
+      seen[id]=1;
+      if(!tracks[id]) tracks[id]={a,r,trail:[]};
+      const tr=tracks[id];
+      if(tr.a!==a || tr.r!==r){
+        tr.trail.push({a,r,t:now});
+        afterglow.push({a,r,t:now});
+      }
+      tr.a=a; tr.r=r; delete tr.dead;
+    }
+  }
+  for(const id in tracks) if(!seen[id]){
+    const tr=tracks[id];
+    if(!tr.dead) tr.dead=now;
+    if(now-tr.dead>TRAIL_MS) delete tracks[id];
+  }
+  if(typeof j.seq==='number') since=j.seq;
+}
+
+let mqttOk=false;
+function connectMqtt(){
+  if(typeof mqtt==='undefined'){ setTimeout(connectMqtt,500); return; }
+  const c=mqtt.connect(MQTT_URL,{
+    clientId:'wfrw-'+Math.random().toString(16).slice(2,10)+Date.now().toString(16).slice(-4),
+    clean:true,
+    reconnectPeriod:2500,
+    connectTimeout:12000,
+    keepalive:30
+  });
+  c.on('connect',()=>{ mqttOk=true; c.subscribe(TOPIC_LIVE,{qos:0}); c.subscribe(TOPIC_MAP,{qos:0}); });
+  c.on('reconnect',()=>{ mqttOk=false; });
+  c.on('close',()=>{ mqttOk=false; });
+  c.on('error',()=>{ mqttOk=false; });
+  c.on('message',(_t,payload)=>{
+    try{ applyState(JSON.parse(payload.toString()), performance.now()); }catch(e){}
+  });
+}
+
+let inflight=false, since=0;
+async function poll(){ /* local polling unused on the remote page */ }
+function drawLink(){
+  // tiny status pip, no text: green = live feed, dim red = reconnecting
+  const x=W-12,y=12;
+  cx.save();
+  cx.fillStyle=mqttOk?'rgba(80,255,120,0.7)':'rgba(180,40,40,0.55)';
+  cx.beginPath(); cx.arc(x,y,3.5,0,7); cx.fill();
+  cx.restore();
+}
+
+connectMqtt();
+draw();
+</script>
+</body></html>
